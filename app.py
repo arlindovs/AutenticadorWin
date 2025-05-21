@@ -1,11 +1,13 @@
 import sys
 import sqlite3
 import mysql.connector
+import psycopg2
 import pyotp
 import bcrypt
 import pyperclip
 import json
 import os
+from cryptography.fernet import Fernet
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                              QPushButton, QSystemTrayIcon, QMenu, QMessageBox, QComboBox, QDialog, QFormLayout,
                              QTableWidget, QTableWidgetItem, QInputDialog, QAction)
@@ -24,6 +26,28 @@ if platform.system() != "Windows":
     print("Este aplicativo só funciona no Windows.")
     sys.exit(1)
 
+# Gerenciamento da chave de criptografia
+KEY_FILE = "encryption_key.key"
+
+# Carrega ou gera a chave de criptografia
+if os.path.exists(KEY_FILE):
+    with open(KEY_FILE, 'rb') as f:
+        ENCRYPTION_KEY = f.read()
+else:
+    ENCRYPTION_KEY = Fernet.generate_key()
+    with open(KEY_FILE, 'wb') as f:
+        f.write(ENCRYPTION_KEY)
+
+CIPHER = Fernet(ENCRYPTION_KEY)
+
+# Função para regenerar a chave de criptografia e atualizar o CIPHER
+def regenerate_encryption_key():
+    global ENCRYPTION_KEY, CIPHER
+    ENCRYPTION_KEY = Fernet.generate_key()
+    with open(KEY_FILE, 'wb') as f:
+        f.write(ENCRYPTION_KEY)
+    CIPHER = Fernet(ENCRYPTION_KEY)
+
 class Database:
     def __init__(self, db_type, **kwargs):
         self.db_type = db_type
@@ -37,7 +61,6 @@ class Database:
             port = kwargs.get("port", 3306)
             if not all([host, user, password]):
                 raise ValueError("Host, usuário e senha são obrigatórios para MySQL")
-
             try:
                 temp_conn = mysql.connector.connect(
                     host=host,
@@ -47,7 +70,6 @@ class Database:
                 )
             except mysql.connector.Error as err:
                 raise mysql.connector.Error(f"Erro ao conectar ao servidor MySQL: {err}")
-
             try:
                 cursor = temp_conn.cursor()
                 cursor.execute("CREATE DATABASE IF NOT EXISTS `authenticator`")
@@ -57,7 +79,6 @@ class Database:
             finally:
                 cursor.close()
                 temp_conn.close()
-
             try:
                 self.conn = mysql.connector.connect(
                     host=host,
@@ -68,6 +89,40 @@ class Database:
                 )
             except mysql.connector.Error as err:
                 raise mysql.connector.Error(f"Erro ao conectar ao banco de dados 'authenticator': {err}")
+        elif db_type == "postgres":
+            host = kwargs.get("host")
+            user = kwargs.get("user")
+            password = kwargs.get("password")
+            port = kwargs.get("port", 5432)
+            database = kwargs.get("database", "authenticator")
+            if not all([host, user, password]):
+                raise ValueError("Host, usuário e senha são obrigatórios para PostgreSQL")
+            try:
+                temp_conn = psycopg2.connect(
+                    host=host,
+                    user=user,
+                    password=password,
+                    port=port
+                )
+                temp_conn.autocommit = True
+                cursor = temp_conn.cursor()
+                cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+                if not cursor.fetchone():
+                    cursor.execute(f"CREATE DATABASE {database}")
+                cursor.close()
+                temp_conn.close()
+            except psycopg2.Error as err:
+                raise psycopg2.Error(f"Erro ao conectar ou criar o banco de dados PostgreSQL: {err}")
+            try:
+                self.conn = psycopg2.connect(
+                    host=host,
+                    user=user,
+                    password=password,
+                    port=port,
+                    database=database
+                )
+            except psycopg2.Error as err:
+                raise psycopg2.Error(f"Erro ao conectar ao banco de dados 'authenticator': {err}")
         self.create_tables()
 
     def create_tables(self):
@@ -104,16 +159,29 @@ class Database:
                 is_default TINYINT(1),
                 FOREIGN KEY (user_id) REFERENCES users(id)
                 )''')
+        elif self.db_type == "postgres":
+            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                                                                   id VARCHAR(36) PRIMARY KEY,
+                username VARCHAR(255) UNIQUE,
+                email VARCHAR(255),
+                password VARCHAR(255),
+                user_type VARCHAR(50) CHECK (user_type IN ('admin', 'user'))
+                )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
+                                                                          id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) REFERENCES users(id),
+                secret VARCHAR(255),
+                label VARCHAR(255),
+                is_default BOOLEAN
+                )''')
         self.conn.commit()
 
     def execute(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type == "sqlite":
-                cursor.execute(query, params)
-            elif self.db_type == "mysql":
-                mysql_query = query.replace('?', '%s')
-                cursor.execute(mysql_query, params)
+            if self.db_type in ("mysql", "postgres"):
+                query = query.replace('?', '%s')
+            cursor.execute(query, params)
             self.conn.commit()
             return cursor
         except Exception as e:
@@ -124,11 +192,9 @@ class Database:
     def fetchall(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type == "sqlite":
-                cursor.execute(query, params)
-            elif self.db_type == "mysql":
-                mysql_query = query.replace('?', '%s')
-                cursor.execute(mysql_query, params)
+            if self.db_type in ("mysql", "postgres"):
+                query = query.replace('?', '%s')
+            cursor.execute(query, params)
             return cursor.fetchall()
         finally:
             cursor.close()
@@ -136,17 +202,15 @@ class Database:
     def fetchone(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type == "sqlite":
-                cursor.execute(query, params)
-            elif self.db_type == "mysql":
-                mysql_query = query.replace('?', '%s')
-                cursor.execute(mysql_query, params)
+            if self.db_type in ("mysql", "postgres"):
+                query = query.replace('?', '%s')
+            cursor.execute(query, params)
             return cursor.fetchone()
         finally:
             cursor.close()
 
 class ConfigDialog(QDialog):
-    def __init__(self):
+    def __init__(self, current_config=None):
         super().__init__()
         self.setWindowTitle("Configuração Inicial")
         self.setStyleSheet("""
@@ -196,44 +260,63 @@ class ConfigDialog(QDialog):
         self.layout = QFormLayout()
 
         self.db_type = QComboBox()
-        self.db_type.addItems(["SQLite", "MySQL"])
+        self.db_type.addItems(["SQLite", "MySQL", "PostgreSQL"])
         self.layout.addRow("Tipo de Banco de Dados:", self.db_type)
 
-        self.mysql_host = QLineEdit()
-        self.mysql_user = QLineEdit()
-        self.mysql_password = QLineEdit()
-        self.mysql_password.setEchoMode(QLineEdit.Password)
-        self.mysql_port = QLineEdit()
-        self.mysql_port.setText("3306")
+        self.db_host = QLineEdit()
+        self.db_user = QLineEdit()
+        self.db_password = QLineEdit()
+        self.db_password.setEchoMode(QLineEdit.Password)
+        self.db_port = QLineEdit()
+        self.db_name = QLineEdit()
 
-        self.layout.addRow("MySQL Host:", self.mysql_host)
-        self.layout.addRow("MySQL User:", self.mysql_user)
-        self.layout.addRow("MySQL Password:", self.mysql_password)
-        self.layout.addRow("MySQL Port:", self.mysql_port)
+        self.layout.addRow("Host:", self.db_host)
+        self.layout.addRow("Usuário:", self.db_user)
+        self.layout.addRow("Senha:", self.db_password)
+        self.layout.addRow("Porta:", self.db_port)
+        self.layout.addRow("Nome do Banco:", self.db_name)
 
         self.submit_button = QPushButton("Confirmar")
         self.submit_button.clicked.connect(self.accept)
         self.layout.addWidget(self.submit_button)
 
         self.setLayout(self.layout)
-        self.db_type.currentTextChanged.connect(self.toggle_mysql_fields)
-        self.toggle_mysql_fields(self.db_type.currentText())
+        self.db_type.currentTextChanged.connect(self.toggle_db_fields)
 
-    def toggle_mysql_fields(self, db_type):
-        mysql_fields = [self.mysql_host, self.mysql_user, self.mysql_password, self.mysql_port]
-        for field in mysql_fields:
-            field.setEnabled(db_type == "MySQL")
+        # Preencher os campos com as configurações atuais, se fornecidas
+        if current_config:
+            db_type = current_config.get("db_type", "sqlite")
+            if db_type == "sqlite":
+                self.db_type.setCurrentText("SQLite")
+            elif db_type == "mysql":
+                self.db_type.setCurrentText("MySQL")
+            else:  # postgres
+                self.db_type.setCurrentText("PostgreSQL")
+
+            self.db_host.setText(current_config.get("host", ""))
+            self.db_user.setText(current_config.get("user", ""))
+            self.db_password.setText(current_config.get("password", ""))
+            self.db_port.setText(str(current_config.get("port", 5432 if db_type == "postgres" else 3306)))
+            self.db_name.setText(current_config.get("database", "authenticator"))
+
+        self.toggle_db_fields(self.db_type.currentText())
+
+    def toggle_db_fields(self, db_type):
+        db_fields = [self.db_host, self.db_user, self.db_password, self.db_port, self.db_name]
+        for field in db_fields:
+            field.setEnabled(db_type in ["MySQL", "PostgreSQL"])
 
     def get_config(self):
         if self.db_type.currentText() == "SQLite":
             return {"db_type": "sqlite", "db_path": "authenticator.db"}
         else:
             return {
-                "db_type": "mysql",
-                "host": self.mysql_host.text(),
-                "user": self.mysql_user.text(),
-                "password": self.mysql_password.text(),
-                "port": int(self.mysql_port.text()) if self.mysql_port.text().isdigit() else 3306
+                "db_type": "mysql" if self.db_type.currentText() == "MySQL" else "postgres",
+                "host": self.db_host.text(),
+                "user": self.db_user.text(),
+                "password": self.db_password.text(),
+                "port": int(self.db_port.text()) if self.db_port.text().isdigit() else (3306 if self.db_type.currentText() == "MySQL" else 5432),
+                "database": self.db_name.text() or "authenticator"
             }
 
 class LoginDialog(QDialog):
@@ -380,7 +463,7 @@ class UserManagementDialog(QDialog):
         self.setLayout(self.layout)
 
     def load_users(self):
-        users = self.db.fetchall("SELECT id, username, email, user_type FROM users")
+        users = self.db.fetchall("SELECT id, username, email, user_type FROM users", ())
         self.table.setRowCount(len(users))
         for row, user in enumerate(users):
             for col, data in enumerate(user):
@@ -547,10 +630,12 @@ class AuthenticatorApp(QMainWindow):
         self.set_default_action = QAction("Definir como Padrão", self)
         self.delete_action = QAction("Excluir Código", self)
         self.manage_users_action = QAction("Gerenciar Usuários", self)
+        self.edit_config_action = QAction("Editar Configurações", self)
 
         self.actions_menu.addAction(self.set_default_action)
         self.actions_menu.addAction(self.delete_action)
         self.actions_menu.addAction(self.manage_users_action)
+        self.actions_menu.addAction(self.edit_config_action)
 
         self.actions_button = QPushButton("⋮")
         self.actions_button.setStyleSheet("font-size: 18px; padding: 10px; border: none;")
@@ -574,6 +659,7 @@ class AuthenticatorApp(QMainWindow):
         self.set_default_action.triggered.connect(self.set_default_code)
         self.delete_action.triggered.connect(self.delete_code)
         self.manage_users_action.triggered.connect(self.manage_users)
+        self.edit_config_action.triggered.connect(self.edit_config)
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_codes)
@@ -583,7 +669,7 @@ class AuthenticatorApp(QMainWindow):
 
     def logout(self):
         self.user = None
-        self.load_codes()  # Limpa a exibição dos códigos
+        self.load_codes()
         self.show_login()
 
     def setup_tray_icon(self):
@@ -631,6 +717,7 @@ class AuthenticatorApp(QMainWindow):
             if user and bcrypt.checkpw(password.encode(), user[1].encode()):
                 self.user = {"id": user[0], "user_type": user[2]}
                 self.manage_users_action.setVisible(self.user["user_type"] == "admin")
+                self.edit_config_action.setVisible(self.user["user_type"] == "admin")
                 self.load_codes()
             else:
                 QMessageBox.warning(self, "Erro", "Usuário ou senha inválidos!")
@@ -645,6 +732,34 @@ class AuthenticatorApp(QMainWindow):
             else:
                 self.show_login()
 
+    def edit_config(self):
+        if self.user["user_type"] != "admin":
+            QMessageBox.warning(self, "Acesso Negado", "Apenas administradores podem editar as configurações.")
+            return
+
+        # Carrega as configurações atuais do config.json
+        config_file = "config.json"
+        current_config = None
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'rb') as f:
+                    encrypted_config = f.read()
+                current_config = json.loads(CIPHER.decrypt(encrypted_config).decode())
+            except Exception as e:
+                QMessageBox.warning(self, "Aviso", f"Falha ao carregar configurações atuais: {e}\nAs configurações serão editadas a partir dos valores padrão.")
+
+        # Abre o diálogo de configuração com as configurações atuais
+        config_dialog = ConfigDialog(current_config=current_config)
+        if config_dialog.exec_():
+            config = config_dialog.get_config()
+            encrypted_config = CIPHER.encrypt(json.dumps(config).encode())
+            with open("config.json", 'wb') as f:
+                f.write(encrypted_config)
+            QMessageBox.information(self, "Sucesso", "Configurações salvas com sucesso. Reinicie o aplicativo.")
+            if self.tray_icon:
+                self.tray_icon.stop()
+            QApplication.quit()
+
     def load_codes(self):
         for i in reversed(range(self.codes_layout.count())):
             widget = self.codes_layout.itemAt(i).widget()
@@ -658,7 +773,7 @@ class AuthenticatorApp(QMainWindow):
                 code_entry = CodeEntry(code[0], code[1], code[2], code[3], self)
                 code_entry.mousePressEvent = lambda event, entry=code_entry: self.copy_code(entry)
                 self.codes_layout.addWidget(code_entry)
-            self.adjustSize()  # Ajusta o tamanho da janela com base no conteúdo
+            self.adjustSize()
 
     def update_codes(self):
         if self.user:
@@ -728,15 +843,25 @@ def main():
     app = QApplication(sys.argv)
 
     config_file = "config.json"
+    config = None
     if os.path.exists(config_file):
-        with open(config_file, 'r') as f:
-            config = json.load(f)
-    else:
+        try:
+            with open(config_file, 'rb') as f:
+                encrypted_config = f.read()
+            config = json.loads(CIPHER.decrypt(encrypted_config).decode())
+        except Exception as e:
+            QMessageBox.warning(None, "Aviso", f"Falha ao descriptografar config.json: {e}\nUm novo arquivo de configuração será criado.")
+            os.remove(config_file)
+            os.remove(KEY_FILE)
+            regenerate_encryption_key()
+
+    if not config:
         config_dialog = ConfigDialog()
         if config_dialog.exec_():
             config = config_dialog.get_config()
-            with open(config_file, 'w') as f:
-                json.dump(config, f)
+            encrypted_config = CIPHER.encrypt(json.dumps(config).encode())
+            with open(config_file, 'wb') as f:
+                f.write(encrypted_config)
         else:
             sys.exit()
 
@@ -749,8 +874,8 @@ def main():
             db.execute("INSERT INTO users (id, username, email, password, user_type) VALUES (?, ?, ?, ?, ?)",
                        (user_id, "admin", "admin@example.com", hashed, "admin"))
             user = db.fetchone("SELECT username FROM users WHERE id = ?", (user_id,))
-    except (mysql.connector.Error, ValueError, Exception) as err:
-        QMessageBox.critical(None, "Erro", f"Falha ao conectar ou configurar o MySQL: {err}")
+    except (mysql.connector.Error, psycopg2.Error, ValueError, Exception) as err:
+        QMessageBox.critical(None, "Erro", f"Falha ao conectar ou configurar o banco de dados: {err}")
         sys.exit()
 
     authenticator = AuthenticatorApp(db)
