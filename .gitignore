@@ -2,3 +2,5 @@
 config.json
 encryption_key.key
 authenticator.db
+/build
+app.spec
