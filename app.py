@@ -53,8 +53,19 @@ class Database:
         self.db_type = db_type
         self.conn = sqlite3.connect("authenticator.db")  # Banco SQLite como base local
         self.server_conn = None  # Conexão opcional com MySQL ou PostgreSQL
-        self.last_sync_time = None  # Para rastrear a última sincronização
         self.create_local_tables()
+
+        # Carregar a configuração anterior para detectar mudanças
+        config_file = "config.json"
+        previous_db_type = "sqlite"  # Padrão se não houver arquivo
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'rb') as f:
+                    encrypted_config = f.read()
+                previous_config = json.loads(CIPHER.decrypt(encrypted_config).decode())
+                previous_db_type = previous_config.get("db_type", "sqlite")
+            except Exception:
+                pass
 
         # Configuração opcional do servidor (MySQL ou PostgreSQL)
         if db_type in ["mysql", "postgres"]:
@@ -80,6 +91,12 @@ class Database:
             except (mysql.connector.Error, psycopg2.Error) as err:
                 QMessageBox.warning(None, "Aviso", f"Não foi possível conectar ao servidor: {err}. Usando SQLite localmente.")
                 self.server_conn = None
+
+        # Sincronizar dados ao inicializar, considerando a troca de servidor
+        if self.server_conn:
+            self.synchronize_data()
+            if previous_db_type != db_type and previous_db_type != "sqlite":
+                QMessageBox.information(None, "Informação", f"Tipo de banco alterado de {previous_db_type} para {db_type}. Dados sincronizados.")
 
     def create_local_tables(self):
         cursor = self.conn.cursor()
@@ -166,82 +183,161 @@ class Database:
         self.conn.commit()
         cursor.close()
 
-    def synchronize_from_server(self):
+    def synchronize_data(self):
         if not self.server_conn:
+            print("Sincronização não realizada: Sem conexão com o servidor.")
             return False
 
         cursor = self.conn.cursor()
         server_cursor = self.server_conn.cursor()
 
         try:
-            # Sincronizar usuários do servidor para o local
-            server_cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users")
-            server_users = server_cursor.fetchall()
-            for user in server_users:
-                cursor.execute("INSERT OR REPLACE INTO users (id, username, email, password, user_type, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
-                               user)
+            # Obter todos os IDs dos usuários no SQLite local
+            cursor.execute("SELECT id FROM users")
+            local_user_ids = set(row[0] for row in cursor.fetchall())
+            print(f"IDs de usuários no SQLite local: {local_user_ids}")
 
-            # Sincronizar códigos TOTP
+            # Obter todos os usuários do servidor
+            server_cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users")
+            server_users = {row[0]: row for row in server_cursor.fetchall()}
+            print(f"Usuários no servidor: {len(server_users)}")
+
+            # Obter todos os usuários do SQLite local
+            cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users")
+            local_users = {row[0]: row for row in cursor.fetchall()}
+            print(f"Usuários no SQLite local: {len(local_users)}")
+
+            # Sincronizar usuários
+            # - Do servidor para o local
+            for user_id, server_user in server_users.items():
+                local_user = local_users.get(user_id)
+                server_last_modified = server_user[5]
+                if local_user:
+                    local_last_modified = datetime.strptime(local_user[5], '%Y-%m-%d %H:%M:%S')
+                    if server_last_modified > local_last_modified:
+                        print(f"Sincronizando usuário do servidor para o local: {user_id}")
+                        cursor.execute("INSERT OR REPLACE INTO users (id, username, email, password, user_type, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                                       server_user[:5] + (server_last_modified.strftime('%Y-%m-%d %H:%M:%S'),))
+                else:
+                    # Novo usuário no servidor
+                    print(f"Sincronizando novo usuário do servidor para o local: {user_id}")
+                    cursor.execute("INSERT OR REPLACE INTO users (id, username, email, password, user_type, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                                   server_user[:5] + (server_last_modified.strftime('%Y-%m-%d %H:%M:%S'),))
+
+            # - Do local para o servidor (incluindo exclusões)
+            for user_id, local_user in local_users.items():
+                server_user = server_users.get(user_id)
+                local_last_modified = datetime.strptime(local_user[5], '%Y-%m-%d %H:%M:%S')
+                if not server_user:
+                    # Usuário excluído no servidor ou novo no local
+                    print(f"Sincronizando exclusão ou novo usuário do local para o servidor: {user_id}")
+                    server_query = "INSERT INTO users (id, username, email, password, user_type, last_modified) VALUES (%s, %s, %s, %s, %s, %s)"
+                    if self.db_type == "mysql":
+                        server_query += " ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email), password=VALUES(password), user_type=VALUES(user_type), last_modified=VALUES(last_modified)"
+                        server_params = local_user
+                    elif self.db_type == "postgres":
+                        server_query += " ON CONFLICT (id) DO UPDATE SET username=EXCLUDED.username, email=EXCLUDED.email, password=EXCLUDED.password, user_type=EXCLUDED.user_type, last_modified=EXCLUDED.last_modified"
+                        server_params = local_user
+                    server_cursor.execute(server_query, server_params)
+                else:
+                    # Comparar last_modified
+                    server_last_modified = server_user[5]
+                    if local_last_modified > server_last_modified:
+                        print(f"Sincronizando usuário atualizado do local para o servidor: {user_id}")
+                        server_query = "INSERT INTO users (id, username, email, password, user_type, last_modified) VALUES (%s, %s, %s, %s, %s, %s)"
+                        if self.db_type == "mysql":
+                            server_query += " ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email), password=VALUES(password), user_type=VALUES(user_type), last_modified=VALUES(last_modified)"
+                            server_params = local_user
+                        elif self.db_type == "postgres":
+                            server_query += " ON CONFLICT (id) DO UPDATE SET username=EXCLUDED.username, email=EXCLUDED.email, password=EXCLUDED.password, user_type=EXCLUDED.user_type, last_modified=EXCLUDED.last_modified"
+                            server_params = local_user
+                        server_cursor.execute(server_query, server_params)
+
+            # Detectar exclusões no local e propagar para o servidor
+            for user_id in local_user_ids - set(local_users.keys()):
+                if user_id in server_users:
+                    print(f"Detectada exclusão local de usuário {user_id}. Excluindo do servidor.")
+                    server_cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                    server_cursor.execute("DELETE FROM totp_secrets WHERE user_id = %s", (user_id,))
+
+            # Sincronizar tabela 'totp_secrets'
+            # Obter todos os IDs dos segredos TOTP no SQLite local
+            cursor.execute("SELECT id FROM totp_secrets")
+            local_secret_ids = set(row[0] for row in cursor.fetchall())
+            print(f"IDs de segredos TOTP no SQLite local: {local_secret_ids}")
+
+            # Obter todos os segredos TOTP do servidor
             server_cursor.execute("SELECT id, user_id, secret, label, is_default, last_modified FROM totp_secrets")
-            server_secrets = server_cursor.fetchall()
-            for secret in server_secrets:
-                cursor.execute("INSERT OR REPLACE INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
-                               secret)
+            server_secrets = {row[0]: row for row in server_cursor.fetchall()}
+            print(f"Segredos TOTP no servidor: {len(server_secrets)}")
+
+            # Obter todos os segredos TOTP do SQLite local
+            cursor.execute("SELECT id, user_id, secret, label, is_default, last_modified FROM totp_secrets")
+            local_secrets = {row[0]: row for row in cursor.fetchall()}
+            print(f"Segredos TOTP no SQLite local: {len(local_secrets)}")
+
+            # Sincronizar segredos TOTP
+            # - Do servidor para o local
+            for secret_id, server_secret in server_secrets.items():
+                local_secret = local_secrets.get(secret_id)
+                server_last_modified = server_secret[5]
+                if local_secret:
+                    local_last_modified = datetime.strptime(local_secret[5], '%Y-%m-%d %H:%M:%S')
+                    if server_last_modified > local_last_modified:
+                        print(f"Sincronizando segredo TOTP do servidor para o local: {secret_id}")
+                        cursor.execute("INSERT OR REPLACE INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                                       server_secret[:5] + (server_last_modified.strftime('%Y-%m-%d %H:%M:%S'),))
+                else:
+                    # Novo segredo no servidor
+                    print(f"Sincronizando novo segredo TOTP do servidor para o local: {secret_id}")
+                    cursor.execute("INSERT OR REPLACE INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                                   server_secret[:5] + (server_last_modified.strftime('%Y-%m-%d %H:%M:%S'),))
+
+            # - Do local para o servidor
+            for secret_id, local_secret in local_secrets.items():
+                server_secret = server_secrets.get(secret_id)
+                local_last_modified = datetime.strptime(local_secret[5], '%Y-%m-%d %H:%M:%S')
+                if not server_secret:
+                    # Novo segredo no SQLite
+                    print(f"Sincronizando novo segredo TOTP do local para o servidor: {secret_id}")
+                    server_query = "INSERT INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (%s, %s, %s, %s, %s, %s)"
+                    if self.db_type == "mysql":
+                        is_default = 1 if local_secret[4] else 0
+                        server_query += " ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), secret=VALUES(secret), label=VALUES(label), is_default=VALUES(is_default), last_modified=VALUES(last_modified)"
+                        server_params = (local_secret[0], local_secret[1], local_secret[2], local_secret[3], is_default, local_secret[5])
+                    elif self.db_type == "postgres":
+                        server_query += " ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, secret=EXCLUDED.secret, label=EXCLUDED.label, is_default=EXCLUDED.is_default, last_modified=EXCLUDED.last_modified"
+                        server_params = (local_secret[0], local_secret[1], local_secret[2], local_secret[3], local_secret[4], local_secret[5])
+                    server_cursor.execute(server_query, server_params)
+                else:
+                    # Comparar last_modified
+                    server_last_modified = server_secret[5]
+                    if local_last_modified > server_last_modified:
+                        print(f"Sincronizando segredo TOTP atualizado do local para o servidor: {secret_id}")
+                        server_query = "INSERT INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (%s, %s, %s, %s, %s, %s)"
+                        if self.db_type == "mysql":
+                            is_default = 1 if local_secret[4] else 0
+                            server_query += " ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), secret=VALUES(secret), label=VALUES(label), is_default=VALUES(is_default), last_modified=VALUES(last_modified)"
+                            server_params = (local_secret[0], local_secret[1], local_secret[2], local_secret[3], is_default, local_secret[5])
+                        elif self.db_type == "postgres":
+                            server_query += " ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, secret=EXCLUDED.secret, label=EXCLUDED.label, is_default=EXCLUDED.is_default, last_modified=EXCLUDED.last_modified"
+                            server_params = (local_secret[0], local_secret[1], local_secret[2], local_secret[3], local_secret[4], local_secret[5])
+                        server_cursor.execute(server_query, server_params)
+
+            # Detectar exclusões no local e propagar para o servidor
+            for secret_id in local_secret_ids - set(local_secrets.keys()):
+                if secret_id in server_secrets:
+                    print(f"Detectada exclusão local de segredo TOTP {secret_id}. Excluindo do servidor.")
+                    server_cursor.execute("DELETE FROM totp_secrets WHERE id = %s", (secret_id,))
 
             self.conn.commit()
-            return True
-        except Exception as e:
-            QMessageBox.warning(None, "Aviso", f"Erro ao sincronizar do servidor: {e}")
-            return False
-        finally:
-            server_cursor.close()
-
-    def synchronize_to_server_from_local(self):
-        if not self.server_conn:
-            return False
-
-        last_sync = self.get_last_sync_time()
-        cursor = self.conn.cursor()
-        server_cursor = self.server_conn.cursor()
-
-        try:
-            # Sincronizar usuários do SQLite para o servidor
-            cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users WHERE last_modified > ?",
-                           (last_sync,))
-            local_users = cursor.fetchall()
-            for user in local_users:
-                server_query = "INSERT INTO users (id, username, email, password, user_type, last_modified) VALUES (%s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE username=%s, email=%s, password=%s, user_type=%s, last_modified=%s"
-                server_params = user + (user[1], user[2], user[3], user[4], user[5])
-                if self.db_type == "mysql":
-                    server_cursor.execute(server_query, server_params)
-                elif self.db_type == "postgres":
-                    server_query = server_query.replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT (id) DO UPDATE SET')
-                    server_query = server_query.replace('username=%s, email=%s, password=%s, user_type=%s, last_modified=%s',
-                                                        'username=EXCLUDED.username, email=EXCLUDED.email, password=EXCLUDED.password, user_type=EXCLUDED.user_type, last_modified=EXCLUDED.last_modified')
-                    server_cursor.execute(server_query, user)
-
-            # Sincronizar códigos TOTP
-            cursor.execute("SELECT id, user_id, secret, label, is_default, last_modified FROM totp_secrets WHERE last_modified > ?",
-                           (last_sync,))
-            local_secrets = cursor.fetchall()
-            for secret in local_secrets:
-                server_query = "INSERT INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (%s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE user_id=%s, secret=%s, label=%s, is_default=%s, last_modified=%s"
-                is_default = 1 if secret[4] else 0  # Converter booleano para MySQL
-                server_params = (secret[0], secret[1], secret[2], secret[3], is_default, secret[5],
-                                 secret[1], secret[2], secret[3], is_default, secret[5])
-                if self.db_type == "mysql":
-                    server_cursor.execute(server_query, server_params)
-                elif self.db_type == "postgres":
-                    server_query = server_query.replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT (id) DO UPDATE SET')
-                    server_query = server_query.replace('user_id=%s, secret=%s, label=%s, is_default=%s, last_modified=%s',
-                                                        'user_id=EXCLUDED.user_id, secret=EXCLUDED.secret, label=EXCLUDED.label, is_default=EXCLUDED.is_default, last_modified=EXCLUDED.last_modified')
-                    server_params = (secret[0], secret[1], secret[2], secret[3], secret[4], secret[5])
-                    server_cursor.execute(server_query, server_params)
-
             self.server_conn.commit()
+            self.update_last_sync_time()
+            print("Sincronização concluída com sucesso.")
             return True
         except Exception as e:
-            QMessageBox.warning(None, "Aviso", f"Erro ao sincronizar com o servidor: {e}")
+            print(f"Erro ao sincronizar dados: {e}")
+            QMessageBox.warning(None, "Aviso", f"Erro ao sincronizar dados com o servidor: {e}")
             return False
         finally:
             server_cursor.close()
@@ -274,13 +370,18 @@ class Database:
 
             # Sincronizar com o servidor se conectado
             if self.db_type in ["mysql", "postgres"] and self.server_conn:
-                self.synchronize_to_server_from_local()
+                success = self.synchronize_data()
+                if not success:
+                    print("Falha na sincronização após operação de escrita.")
+                    QMessageBox.warning(None, "Aviso", "Operação realizada localmente, mas falha ao sincronizar com o servidor. Verifique a conexão e tente novamente.")
 
             return cursor
         except sqlite3.Error as e:
+            print(f"Erro ao executar comando SQL no SQLite: {e}")
             QMessageBox.critical(None, "Erro", f"Erro ao executar comando SQL no SQLite: {e}")
             raise
         except Exception as e:
+            print(f"Erro inesperado: {e}")
             QMessageBox.critical(None, "Erro", f"Erro inesperado: {e}")
             raise
         finally:
@@ -292,6 +393,7 @@ class Database:
             cursor.execute(query, params)
             return cursor.fetchall()
         except sqlite3.Error as e:
+            print(f"Erro ao executar consulta no SQLite: {e}")
             QMessageBox.critical(None, "Erro", f"Erro ao executar consulta no SQLite: {e}")
             raise
         finally:
@@ -303,6 +405,7 @@ class Database:
             cursor.execute(query, params)
             return cursor.fetchone()
         except sqlite3.Error as e:
+            print(f"Erro ao executar consulta no SQLite: {e}")
             QMessageBox.critical(None, "Erro", f"Erro ao executar consulta no SQLite: {e}")
             raise
         finally:
@@ -889,19 +992,6 @@ def main():
 
     try:
         db = Database(**config)
-        # Sincronizar ambos os sentidos ao iniciar
-        if config["db_type"] in ["mysql", "postgres"]:
-            if db.server_conn:
-                # Primeiro, sincronizar do servidor para o local
-                if not db.synchronize_from_server():
-                    QMessageBox.information(None, "Informação", "Sem conexão com o servidor para sincronizar do servidor. Verificando alterações locais.")
-                # Depois, sincronizar do local para o servidor
-                if not db.synchronize_to_server_from_local():
-                    QMessageBox.information(None, "Informação", "Sem conexão com o servidor para sincronizar alterações locais.")
-                db.update_last_sync_time()
-            else:
-                QMessageBox.information(None, "Informação", "Sem conexão com o servidor. Usando dados locais do SQLite.")
-
         admin_user = db.fetchone("SELECT username FROM users WHERE username = ?", ("admin",))
         if not admin_user:
             hashed = bcrypt.hashpw("admin".encode(), bcrypt.gensalt()).decode()
