@@ -51,211 +51,282 @@ def regenerate_encryption_key():
 class Database:
     def __init__(self, db_type, **kwargs):
         self.db_type = db_type
-        self.conn = None
-        if db_type == "sqlite":
-            self.conn = sqlite3.connect(kwargs.get("db_path", "authenticator.db"))
-        elif db_type == "mysql":
-            host = kwargs.get("host")
-            user = kwargs.get("user")
-            password = kwargs.get("password")
-            port = kwargs.get("port", 3306)
-            if not all([host, user, password]):
-                raise ValueError("Host, usuário e senha são obrigatórios para MySQL")
-            try:
-                temp_conn = mysql.connector.connect(
-                    host=host,
-                    user=user,
-                    password=password,
-                    port=port
-                )
-            except mysql.connector.Error as err:
-                raise mysql.connector.Error(f"Erro ao conectar ao servidor MySQL: {err}")
-            try:
-                cursor = temp_conn.cursor()
-                cursor.execute("CREATE DATABASE IF NOT EXISTS `authenticator`")
-                temp_conn.commit()
-            except mysql.connector.Error as err:
-                raise mysql.connector.Error(f"Erro ao criar o banco de dados: {err}")
-            finally:
-                cursor.close()
-                temp_conn.close()
-            try:
-                self.conn = mysql.connector.connect(
-                    host=host,
-                    user=user,
-                    password=password,
-                    port=port,
-                    database="authenticator"
-                )
-            except mysql.connector.Error as err:
-                raise mysql.connector.Error(f"Erro ao conectar ao banco de dados 'authenticator': {err}")
-        elif db_type == "postgres":
-            host = kwargs.get("host")
-            user = kwargs.get("user")
-            password = kwargs.get("password")
-            port = kwargs.get("port", 5432)
-            database = kwargs.get("database", "authenticator")
-            if not all([host, user, password]):
-                raise ValueError("Host, usuário e senha são obrigatórios para PostgreSQL")
-            try:
-                temp_conn = psycopg2.connect(
-                    host=host,
-                    user=user,
-                    password=password,
-                    port=port
-                )
-                temp_conn.autocommit = True
-                cursor = temp_conn.cursor()
-                cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
-                if not cursor.fetchone():
-                    cursor.execute(f"CREATE DATABASE {database}")
-                cursor.close()
-                temp_conn.close()
-            except psycopg2.Error as err:
-                raise psycopg2.Error(f"Erro ao conectar ou criar o banco de dados PostgreSQL: {err}")
-            try:
-                self.conn = psycopg2.connect(
-                    host=host,
-                    user=user,
-                    password=password,
-                    port=port,
-                    database=database
-                )
-            except psycopg2.Error as err:
-                raise psycopg2.Error(f"Erro ao conectar ao banco de dados 'authenticator': {err}")
-        self.create_tables()
+        self.conn = sqlite3.connect("authenticator.db")  # Banco SQLite como base local
+        self.server_conn = None  # Conexão opcional com MySQL ou PostgreSQL
+        self.last_sync_time = None  # Para rastrear a última sincronização
+        self.create_local_tables()
 
-    def create_tables(self):
+        # Configuração opcional do servidor (MySQL ou PostgreSQL)
+        if db_type in ["mysql", "postgres"]:
+            try:
+                if db_type == "mysql":
+                    self.server_conn = mysql.connector.connect(
+                        host=kwargs.get("host"),
+                        user=kwargs.get("user"),
+                        password=kwargs.get("password"),
+                        port=kwargs.get("port", 3306),
+                        database=kwargs.get("database", "authenticator")
+                    )
+                    self.create_server_tables("mysql")
+                elif db_type == "postgres":
+                    self.server_conn = psycopg2.connect(
+                        host=kwargs.get("host"),
+                        user=kwargs.get("user"),
+                        password=kwargs.get("password"),
+                        port=kwargs.get("port", 5432),
+                        database=kwargs.get("database", "authenticator")
+                    )
+                    self.create_server_tables("postgres")
+            except (mysql.connector.Error, psycopg2.Error) as err:
+                QMessageBox.warning(None, "Aviso", f"Não foi possível conectar ao servidor: {err}. Usando SQLite localmente.")
+                self.server_conn = None
+
+    def create_local_tables(self):
         cursor = self.conn.cursor()
-        if self.db_type == "sqlite":
-            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                                                                   id TEXT PRIMARY KEY,
-                                                                   username TEXT UNIQUE,
-                                                                   email TEXT,
-                                                                   password TEXT,
-                                                                   user_type TEXT
-                              )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
-                                                                          id TEXT PRIMARY KEY,
-                                                                          user_id TEXT,
-                                                                          secret TEXT,
-                                                                          label TEXT,
-                                                                          is_default BOOLEAN,
-                                                                          FOREIGN KEY (user_id) REFERENCES users(id)
-                )''')
-        elif self.db_type == "mysql":
-            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                                                                   id VARCHAR(36) PRIMARY KEY,
-                username VARCHAR(255) UNIQUE,
-                email VARCHAR(255),
-                password VARCHAR(255),
-                user_type ENUM('admin', 'user')
-                )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
-                                                                          id VARCHAR(36) PRIMARY KEY,
-                user_id VARCHAR(36),
-                secret VARCHAR(255),
-                label VARCHAR(255),
-                is_default TINYINT(1),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-                )''')
-        elif self.db_type == "postgres":
-            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                                                                   id VARCHAR(36) PRIMARY KEY,
-                username VARCHAR(255) UNIQUE,
-                email VARCHAR(255),
-                password VARCHAR(255),
-                user_type VARCHAR(50) CHECK (user_type IN ('admin', 'user'))
-                )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
-                                                                          id VARCHAR(36) PRIMARY KEY,
-                user_id VARCHAR(36) REFERENCES users(id),
-                secret VARCHAR(255),
-                label VARCHAR(255),
-                is_default BOOLEAN
-                )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                                                               id TEXT PRIMARY KEY,
+                                                               username TEXT UNIQUE,
+                                                               email TEXT,
+                                                               password TEXT,
+                                                               user_type TEXT,
+                                                               last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                          )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
+                                                                      id TEXT PRIMARY KEY,
+                                                                      user_id TEXT,
+                                                                      secret TEXT,
+                                                                      label TEXT,
+                                                                      is_default BOOLEAN,
+                                                                      last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                      FOREIGN KEY (user_id) REFERENCES users(id)
+            )''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sync_log (
+                                                                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                  last_sync_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                          )''')
         self.conn.commit()
+
+    def create_server_tables(self, db_type):
+        if not self.server_conn:
+            return
+        server_cursor = self.server_conn.cursor()
+        try:
+            if db_type == "mysql":
+                server_cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                                                                              id VARCHAR(36) PRIMARY KEY,
+                    username VARCHAR(255) UNIQUE,
+                    email VARCHAR(255),
+                    password VARCHAR(255),
+                    user_type VARCHAR(50),
+                    last_modified DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                server_cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
+                                                                                     id VARCHAR(36) PRIMARY KEY,
+                    user_id VARCHAR(36),
+                    secret VARCHAR(255),
+                    label VARCHAR(255),
+                    is_default TINYINT,
+                    last_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                    )''')
+            elif db_type == "postgres":
+                server_cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                                                                              id UUID PRIMARY KEY,
+                                                                              username VARCHAR(255) UNIQUE,
+                    email VARCHAR(255),
+                    password VARCHAR(255),
+                    user_type VARCHAR(50),
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                server_cursor.execute('''CREATE TABLE IF NOT EXISTS totp_secrets (
+                                                                                     id UUID PRIMARY KEY,
+                                                                                     user_id UUID,
+                                                                                     secret VARCHAR(255),
+                    label VARCHAR(255),
+                    is_default BOOLEAN,
+                    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                    )''')
+            self.server_conn.commit()
+        except Exception as e:
+            QMessageBox.warning(None, "Aviso", f"Erro ao criar tabelas no servidor: {e}")
+        finally:
+            server_cursor.close()
+
+    def get_last_sync_time(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT last_sync_time FROM sync_log ORDER BY id DESC LIMIT 1")
+        result = cursor.fetchone()
+        cursor.close()
+        return result[0] if result else "2000-01-01 00:00:00"
+
+    def update_last_sync_time(self):
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT INTO sync_log (last_sync_time) VALUES (CURRENT_TIMESTAMP)")
+        self.conn.commit()
+        cursor.close()
+
+    def synchronize_from_server(self):
+        if not self.server_conn:
+            return False
+
+        cursor = self.conn.cursor()
+        server_cursor = self.server_conn.cursor()
+
+        try:
+            # Sincronizar usuários do servidor para o local
+            server_cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users")
+            server_users = server_cursor.fetchall()
+            for user in server_users:
+                cursor.execute("INSERT OR REPLACE INTO users (id, username, email, password, user_type, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                               user)
+
+            # Sincronizar códigos TOTP
+            server_cursor.execute("SELECT id, user_id, secret, label, is_default, last_modified FROM totp_secrets")
+            server_secrets = server_cursor.fetchall()
+            for secret in server_secrets:
+                cursor.execute("INSERT OR REPLACE INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (?, ?, ?, ?, ?, ?)",
+                               secret)
+
+            self.conn.commit()
+            return True
+        except Exception as e:
+            QMessageBox.warning(None, "Aviso", f"Erro ao sincronizar do servidor: {e}")
+            return False
+        finally:
+            server_cursor.close()
+
+    def synchronize_to_server_from_local(self):
+        if not self.server_conn:
+            return False
+
+        last_sync = self.get_last_sync_time()
+        cursor = self.conn.cursor()
+        server_cursor = self.server_conn.cursor()
+
+        try:
+            # Sincronizar usuários do SQLite para o servidor
+            cursor.execute("SELECT id, username, email, password, user_type, last_modified FROM users WHERE last_modified > ?",
+                           (last_sync,))
+            local_users = cursor.fetchall()
+            for user in local_users:
+                server_query = "INSERT INTO users (id, username, email, password, user_type, last_modified) VALUES (%s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE username=%s, email=%s, password=%s, user_type=%s, last_modified=%s"
+                server_params = user + (user[1], user[2], user[3], user[4], user[5])
+                if self.db_type == "mysql":
+                    server_cursor.execute(server_query, server_params)
+                elif self.db_type == "postgres":
+                    server_query = server_query.replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT (id) DO UPDATE SET')
+                    server_query = server_query.replace('username=%s, email=%s, password=%s, user_type=%s, last_modified=%s',
+                                                        'username=EXCLUDED.username, email=EXCLUDED.email, password=EXCLUDED.password, user_type=EXCLUDED.user_type, last_modified=EXCLUDED.last_modified')
+                    server_cursor.execute(server_query, user)
+
+            # Sincronizar códigos TOTP
+            cursor.execute("SELECT id, user_id, secret, label, is_default, last_modified FROM totp_secrets WHERE last_modified > ?",
+                           (last_sync,))
+            local_secrets = cursor.fetchall()
+            for secret in local_secrets:
+                server_query = "INSERT INTO totp_secrets (id, user_id, secret, label, is_default, last_modified) VALUES (%s, %s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE user_id=%s, secret=%s, label=%s, is_default=%s, last_modified=%s"
+                is_default = 1 if secret[4] else 0  # Converter booleano para MySQL
+                server_params = (secret[0], secret[1], secret[2], secret[3], is_default, secret[5],
+                                 secret[1], secret[2], secret[3], is_default, secret[5])
+                if self.db_type == "mysql":
+                    server_cursor.execute(server_query, server_params)
+                elif self.db_type == "postgres":
+                    server_query = server_query.replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT (id) DO UPDATE SET')
+                    server_query = server_query.replace('user_id=%s, secret=%s, label=%s, is_default=%s, last_modified=%s',
+                                                        'user_id=EXCLUDED.user_id, secret=EXCLUDED.secret, label=EXCLUDED.label, is_default=EXCLUDED.is_default, last_modified=EXCLUDED.last_modified')
+                    server_params = (secret[0], secret[1], secret[2], secret[3], secret[4], secret[5])
+                    server_cursor.execute(server_query, server_params)
+
+            self.server_conn.commit()
+            return True
+        except Exception as e:
+            QMessageBox.warning(None, "Aviso", f"Erro ao sincronizar com o servidor: {e}")
+            return False
+        finally:
+            server_cursor.close()
+            cursor.close()
 
     def execute(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type in ("mysql", "postgres"):
-                query = query.replace('?', '%s')
-            cursor.execute(query, params)
+            # Atualizar o timestamp de last_modified para INSERT e UPDATE
+            if "INSERT INTO users" in query or "UPDATE users" in query:
+                cursor.execute(query, params)
+                if "INSERT INTO users" in query:
+                    user_id = params[0]  # O ID é o primeiro parâmetro
+                    cursor.execute("UPDATE users SET last_modified = CURRENT_TIMESTAMP WHERE id = ?", (user_id,))
+                elif "UPDATE users" in query:
+                    user_id = params[-1]  # O ID é o último parâmetro no UPDATE
+                    cursor.execute("UPDATE users SET last_modified = CURRENT_TIMESTAMP WHERE id = ?", (user_id,))
+            elif "INSERT INTO totp_secrets" in query or "UPDATE totp_secrets" in query:
+                cursor.execute(query, params)
+                if "INSERT INTO totp_secrets" in query:
+                    code_id = params[0]  # O ID é o primeiro parâmetro
+                    cursor.execute("UPDATE totp_secrets SET last_modified = CURRENT_TIMESTAMP WHERE id = ?", (code_id,))
+                elif "UPDATE totp_secrets" in query:
+                    code_id = params[-1]  # O ID é o último parâmetro no UPDATE
+                    cursor.execute("UPDATE totp_secrets SET last_modified = CURRENT_TIMESTAMP WHERE id = ?", (code_id,))
+            else:
+                cursor.execute(query, params)
+
             self.conn.commit()
+
+            # Sincronizar com o servidor se conectado
+            if self.db_type in ["mysql", "postgres"] and self.server_conn:
+                self.synchronize_to_server_from_local()
+
             return cursor
+        except sqlite3.Error as e:
+            QMessageBox.critical(None, "Erro", f"Erro ao executar comando SQL no SQLite: {e}")
+            raise
         except Exception as e:
-            raise Exception(f"Erro ao executar comando SQL: {e}")
+            QMessageBox.critical(None, "Erro", f"Erro inesperado: {e}")
+            raise
         finally:
             cursor.close()
 
     def fetchall(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type in ("mysql", "postgres"):
-                query = query.replace('?', '%s')
             cursor.execute(query, params)
             return cursor.fetchall()
+        except sqlite3.Error as e:
+            QMessageBox.critical(None, "Erro", f"Erro ao executar consulta no SQLite: {e}")
+            raise
         finally:
             cursor.close()
 
     def fetchone(self, query, params=()):
         cursor = self.conn.cursor()
         try:
-            if self.db_type in ("mysql", "postgres"):
-                query = query.replace('?', '%s')
             cursor.execute(query, params)
             return cursor.fetchone()
+        except sqlite3.Error as e:
+            QMessageBox.critical(None, "Erro", f"Erro ao executar consulta no SQLite: {e}")
+            raise
         finally:
             cursor.close()
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+        if self.server_conn:
+            self.server_conn.close()
 
 class ConfigDialog(QDialog):
     def __init__(self, current_config=None):
         super().__init__()
         self.setWindowTitle("Configuração Inicial")
         self.setStyleSheet("""
-            QDialog {
-                background-color: #212121;
-                font-family: 'Arial', sans-serif;
-                color: #E0E0E0;
-            }
-            QLineEdit {
-                background-color: #424242;
-                border: 1px solid #616161;
-                border-radius: 4px;
-                padding: 8px;
-                font-size: 14px;
-                color: #E0E0E0;
-            }
-            QComboBox {
-                background-color: #424242;
-                border: 1px solid #616161;
-                border-radius: 4px;
-                padding: 8px;
-                font-size: 14px;
-                color: #E0E0E0;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox::down-arrow {
-                image: none;
-            }
-            QPushButton {
-                background-color: #0288D1;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 4px;
-                padding: 8px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #0277BD;
-            }
-            QLabel {
-                font-size: 14px;
-                color: #E0E0E0;
-            }
+            QDialog { background-color: #212121; font-family: 'Arial', sans-serif; color: #E0E0E0; }
+            QLineEdit { background-color: #424242; border: 1px solid #616161; border-radius: 4px; padding: 8px; font-size: 14px; color: #E0E0E0; }
+            QComboBox { background-color: #424242; border: 1px solid #616161; border-radius: 4px; padding: 8px; font-size: 14px; color: #E0E0E0; }
+            QComboBox::drop-down { border: none; }
+            QComboBox::down-arrow { image: none; }
+            QPushButton { background-color: #0288D1; color: #E0E0E0; border: none; border-radius: 4px; padding: 8px; font-size: 12px; }
+            QPushButton:hover { background-color: #0277BD; }
+            QLabel { font-size: 14px; color: #E0E0E0; }
         """)
         self.layout = QFormLayout()
 
@@ -283,14 +354,13 @@ class ConfigDialog(QDialog):
         self.setLayout(self.layout)
         self.db_type.currentTextChanged.connect(self.toggle_db_fields)
 
-        # Preencher os campos com as configurações atuais, se fornecidas
         if current_config:
             db_type = current_config.get("db_type", "sqlite")
             if db_type == "sqlite":
                 self.db_type.setCurrentText("SQLite")
             elif db_type == "mysql":
                 self.db_type.setCurrentText("MySQL")
-            else:  # postgres
+            else:
                 self.db_type.setCurrentText("PostgreSQL")
 
             self.db_host.setText(current_config.get("host", ""))
@@ -308,7 +378,7 @@ class ConfigDialog(QDialog):
 
     def get_config(self):
         if self.db_type.currentText() == "SQLite":
-            return {"db_type": "sqlite", "db_path": "authenticator.db"}
+            return {"db_type": "sqlite"}
         else:
             return {
                 "db_type": "mysql" if self.db_type.currentText() == "MySQL" else "postgres",
@@ -325,34 +395,11 @@ class LoginDialog(QDialog):
         self.db = db
         self.setWindowTitle("Login")
         self.setStyleSheet("""
-            QDialog {
-                background-color: #212121;
-                font-family: 'Arial', sans-serif;
-                color: #E0E0E0;
-            }
-            QLineEdit {
-                background-color: #424242;
-                border: 1px solid #616161;
-                border-radius: 4px;
-                padding: 8px;
-                font-size: 14px;
-                color: #E0E0E0;
-            }
-            QPushButton {
-                background-color: #0288D1;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #0277BD;
-            }
-            QLabel {
-                font-size: 14px;
-                color: #E0E0E0;
-            }
+            QDialog { background-color: #212121; font-family: 'Arial', sans-serif; color: #E0E0E0; }
+            QLineEdit { background-color: #424242; border: 1px solid #616161; border-radius: 4px; padding: 8px; font-size: 14px; color: #E0E0E0; }
+            QPushButton { background-color: #0288D1; color: #E0E0E0; border: none; border-radius: 4px; padding: 6px 12px; font-size: 12px; }
+            QPushButton:hover { background-color: #0277BD; }
+            QLabel { font-size: 14px; color: #E0E0E0; }
         """)
         self.layout = QFormLayout()
         self.layout.setSpacing(10)
@@ -399,43 +446,14 @@ class UserManagementDialog(QDialog):
         self.db = db
         self.setWindowTitle("Gerenciar Usuários")
         self.setStyleSheet("""
-            QDialog {
-                background-color: #212121;
-                font-family: 'Arial', sans-serif;
-                color: #E0E0E0;
-            }
-            QTableWidget {
-                background-color: #424242;
-                border: none;
-                color: #E0E0E0;
-            }
-            QTableWidget::item {
-                padding: 10px;
-                border-bottom: 1px solid #616161;
-            }
-            QHeaderView::section {
-                background-color: #424242;
-                color: #E0E0E0;
-                padding: 5px;
-                border: none;
-            }
-            QPushButton {
-                background-color: #0288D1;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 4px;
-                padding: 8px;
-                font-size: 12px;
-            }
-            QPushButton#resetButton {
-                background-color: #D32F2F;
-            }
-            QPushButton:hover {
-                background-color: #0277BD;
-            }
-            QPushButton#resetButton:hover {
-                background-color: #B71C1C;
-            }
+            QDialog { background-color: #212121; font-family: 'Arial', sans-serif; color: #E0E0E0; }
+            QTableWidget { background-color: #424242; border: none; color: #E0E0E0; }
+            QTableWidget::item { padding: 10px; border-bottom: 1px solid #616161; }
+            QHeaderView::section { background-color: #424242; color: #E0E0E0; padding: 5px; border: none; }
+            QPushButton { background-color: #0288D1; color: #E0E0E0; border: none; border-radius: 4px; padding: 8px; font-size: 12px; }
+            QPushButton#resetButton { background-color: #D32F2F; }
+            QPushButton:hover { background-color: #0277BD; }
+            QPushButton#resetButton:hover { background-color: #B71C1C; }
         """)
         self.layout = QVBoxLayout()
 
@@ -470,35 +488,66 @@ class UserManagementDialog(QDialog):
                 self.table.setItem(row, col, QTableWidgetItem(str(data)))
 
     def add_user(self):
-        username, _ = QInputDialog.getText(self, "Novo Usuário", "Usuário:")
-        email, _ = QInputDialog.getText(self, "Novo Usuário", "Email:")
-        password, _ = QInputDialog.getText(self, "Novo Usuário", "Senha:", QLineEdit.Password)
-        user_type, _ = QInputDialog.getItem(self, "Novo Usuário", "Tipo:", ["admin", "user"], 0, False)
-        if username and password:
+        username, ok1 = QInputDialog.getText(self, "Novo Usuário", "Usuário:")
+        if not ok1 or not username:
+            return
+        email, ok2 = QInputDialog.getText(self, "Novo Usuário", "Email:")
+        if not ok2:
+            return
+        password, ok3 = QInputDialog.getText(self, "Novo Usuário", "Senha:", QLineEdit.Password)
+        if not ok3 or not password:
+            return
+        user_type, ok4 = QInputDialog.getItem(self, "Novo Usuário", "Tipo:", ["admin", "user"], 0, False)
+        if not ok4:
+            return
+        try:
             hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+            user_id = str(uuid.uuid4())
             self.db.execute("INSERT INTO users (id, username, email, password, user_type) VALUES (?, ?, ?, ?, ?)",
-                            (str(uuid.uuid4()), username, email, hashed, user_type))
+                            (user_id, username, email, hashed, user_type))
             self.load_users()
+            QMessageBox.information(self, "Sucesso", "Usuário adicionado com sucesso!")
+        except sqlite3.IntegrityError as e:
+            QMessageBox.warning(self, "Erro", f"Erro ao adicionar usuário: {e}\nPossivelmente o nome de usuário já existe.")
 
     def edit_user(self):
         selected = self.table.currentRow()
         if selected >= 0:
             user_id = self.table.item(selected, 0).text()
-            username, _ = QInputDialog.getText(self, "Editar Usuário", "Usuário:")
-            email, _ = QInputDialog.getText(self, "Editar Usuário", "Email:")
-            user_type, _ = QInputDialog.getItem(self, "Editar Usuário", "Tipo:", ["admin", "user"], 0, False)
-            if username:
+            username, ok1 = QInputDialog.getText(self, "Editar Usuário", "Usuário:")
+            if not ok1 or not username:
+                return
+            email, ok2 = QInputDialog.getText(self, "Editar Usuário", "Email:")
+            if not ok2:
+                return
+            user_type, ok3 = QInputDialog.getItem(self, "Editar Usuário", "Tipo:", ["admin", "user"], 0, False)
+            if not ok3:
+                return
+            try:
                 self.db.execute("UPDATE users SET username = ?, email = ?, user_type = ? WHERE id = ?",
                                 (username, email, user_type, user_id))
                 self.load_users()
+                QMessageBox.information(self, "Sucesso", "Usuário editado com sucesso!")
+            except sqlite3.IntegrityError as e:
+                QMessageBox.warning(self, "Erro", f"Erro ao editar usuário: {e}\nPossivelmente o nome de usuário já existe.")
+        else:
+            QMessageBox.warning(self, "Aviso", "Selecione um usuário para editar.")
 
     def delete_user(self):
         selected = self.table.currentRow()
         if selected >= 0:
             user_id = self.table.item(selected, 0).text()
-            self.db.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            self.db.execute("DELETE FROM totp_secrets WHERE user_id = ?", (user_id,))
-            self.load_users()
+            username = self.table.item(selected, 1).text()
+            reply = QMessageBox.question(self, "Excluir Usuário",
+                                         f"Deseja excluir o usuário '{username}'?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                self.db.execute("DELETE FROM totp_secrets WHERE user_id = ?", (user_id,))
+                self.load_users()
+                QMessageBox.information(self, "Sucesso", "Usuário excluído com sucesso!")
+        else:
+            QMessageBox.warning(self, "Aviso", "Selecione um usuário para excluir.")
 
     def reset_password(self):
         selected = self.table.currentRow()
@@ -568,36 +617,12 @@ class AuthenticatorApp(QMainWindow):
         self.setWindowFlags(Qt.WindowStaysOnTopHint)
 
         self.setStyleSheet("""
-            QMainWindow {
-                background-color: #212121;
-                font-family: 'Arial', sans-serif;
-                color: #E0E0E0;
-            }
-            QPushButton#fab {
-                background-color: #0288D1;
-                color: #E0E0E0;
-                border: none;
-                border-radius: 28px;
-                width: 56px;
-                height: 56px;
-                font-size: 24px;
-            }
-            QPushButton#fab:hover {
-                background-color: #0277BD;
-            }
-            QToolBar {
-                background-color: #212121;
-                border: none;
-            }
-            QPushButton {
-                background-color: #424242;
-                color: #E0E0E0;
-                border: none;
-                padding: 5px;
-            }
-            QPushButton:hover {
-                background-color: #616161;
-            }
+            QMainWindow { background-color: #212121; font-family: 'Arial', sans-serif; color: #E0E0E0; }
+            QPushButton#fab { background-color: #0288D1; color: #E0E0E0; border: none; border-radius: 28px; width: 56px; height: 56px; font-size: 24px; }
+            QPushButton#fab:hover { background-color: #0277BD; }
+            QToolBar { background-color: #212121; border: none; }
+            QPushButton { background-color: #424242; color: #E0E0E0; border: none; padding: 5px; }
+            QPushButton:hover { background-color: #616161; }
         """)
 
         self.central_widget = QWidget()
@@ -613,16 +638,8 @@ class AuthenticatorApp(QMainWindow):
         self.logout_button = QPushButton("Logoff")
         self.logout_button.clicked.connect(self.logout)
         self.logout_button.setStyleSheet("""
-            QPushButton {
-                background-color: #D32F2F;
-                color: #E0E0E0;
-                border: none;
-                padding: 5px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #B71C1C;
-            }
+            QPushButton { background-color: #D32F2F; color: #E0E0E0; border: none; padding: 5px; font-size: 12px; }
+            QPushButton:hover { background-color: #B71C1C; }
         """)
 
         self.actions_menu = QMenu()
@@ -698,7 +715,7 @@ class AuthenticatorApp(QMainWindow):
             Item("Restaurar", lambda icon: on_restore(icon)),
             Item("Sair", lambda icon: on_exit(icon))
         )
-        self.tray_icon = pystray.Icon("Authenticator", icon=create_icon(), title="Authenticator", menu=menu)
+        self.tray_icon = pystray.Icon("Authenticator", icon=create_icon(), title="Autenticador", menu=menu)
 
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
@@ -737,7 +754,6 @@ class AuthenticatorApp(QMainWindow):
             QMessageBox.warning(self, "Acesso Negado", "Apenas administradores podem editar as configurações.")
             return
 
-        # Carrega as configurações atuais do config.json
         config_file = "config.json"
         current_config = None
         if os.path.exists(config_file):
@@ -748,12 +764,11 @@ class AuthenticatorApp(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Aviso", f"Falha ao carregar configurações atuais: {e}\nAs configurações serão editadas a partir dos valores padrão.")
 
-        # Abre o diálogo de configuração com as configurações atuais
         config_dialog = ConfigDialog(current_config=current_config)
         if config_dialog.exec_():
             config = config_dialog.get_config()
             encrypted_config = CIPHER.encrypt(json.dumps(config).encode())
-            with open("config.json", 'wb') as f:
+            with open(config_file, 'wb') as f:
                 f.write(encrypted_config)
             QMessageBox.information(self, "Sucesso", "Configurações salvas com sucesso. Reinicie o aplicativo.")
             if self.tray_icon:
@@ -783,12 +798,19 @@ class AuthenticatorApp(QMainWindow):
                     widget.update()
 
     def add_code(self):
-        label, _ = QInputDialog.getText(self, "Novo Código", "Rótulo:")
-        secret, _ = QInputDialog.getText(self, "Novo Código", "Chave Secreta:")
-        if label and secret:
+        label, ok1 = QInputDialog.getText(self, "Novo Código", "Rótulo:")
+        if not ok1 or not label:
+            return
+        secret, ok2 = QInputDialog.getText(self, "Novo Código", "Chave Secreta:")
+        if not ok2 or not secret:
+            return
+        try:
             self.db.execute("INSERT INTO totp_secrets (id, user_id, secret, label, is_default) VALUES (?, ?, ?, ?, ?)",
                             (str(uuid.uuid4()), self.user["id"], secret, label, False))
             self.load_codes()
+            QMessageBox.information(self, "Sucesso", "Código TOTP adicionado com sucesso!")
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Erro ao adicionar código: {e}")
 
     def set_default_code(self):
         codes = self.db.fetchall("SELECT id, label FROM totp_secrets WHERE user_id = ?", (self.user["id"],))
@@ -867,6 +889,19 @@ def main():
 
     try:
         db = Database(**config)
+        # Sincronizar ambos os sentidos ao iniciar
+        if config["db_type"] in ["mysql", "postgres"]:
+            if db.server_conn:
+                # Primeiro, sincronizar do servidor para o local
+                if not db.synchronize_from_server():
+                    QMessageBox.information(None, "Informação", "Sem conexão com o servidor para sincronizar do servidor. Verificando alterações locais.")
+                # Depois, sincronizar do local para o servidor
+                if not db.synchronize_to_server_from_local():
+                    QMessageBox.information(None, "Informação", "Sem conexão com o servidor para sincronizar alterações locais.")
+                db.update_last_sync_time()
+            else:
+                QMessageBox.information(None, "Informação", "Sem conexão com o servidor. Usando dados locais do SQLite.")
+
         admin_user = db.fetchone("SELECT username FROM users WHERE username = ?", ("admin",))
         if not admin_user:
             hashed = bcrypt.hashpw("admin".encode(), bcrypt.gensalt()).decode()
@@ -875,7 +910,7 @@ def main():
                        (user_id, "admin", "admin@example.com", hashed, "admin"))
             user = db.fetchone("SELECT username FROM users WHERE id = ?", (user_id,))
     except (mysql.connector.Error, psycopg2.Error, ValueError, Exception) as err:
-        QMessageBox.critical(None, "Erro", f"Falha ao conectar ou configurar o banco de dados: {err}")
+        QMessageBox.critical(None, "Erro", f"Falha ao configurar o banco de dados local: {err}")
         sys.exit()
 
     authenticator = AuthenticatorApp(db)
